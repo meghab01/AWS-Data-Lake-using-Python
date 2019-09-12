@@ -1,0 +1,661 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType, ArrayType, DataType
+from pyspark.sql import SparkSession
+from nameparser import HumanName
+import json
+import re
+import boto3
+import time, datetime
+
+# Arguments that are passed from the .root.yaml, to the .etl.yaml, to this .py script
+args = getResolvedOptions(sys.argv,  [
+	'JOB_NAME',
+	'lakeBucketName',
+	'lakeDestinationPath',
+	'swampDatabaseName',
+	'swampIntakesReportTableName',
+	'swampOutcomesReportTableName',
+	'swampDynamoDBTableName',
+	'swampDynamoDBTable2Name',
+	'lakeDatabaseName',
+	'lakeTableName',
+	'regionalCenters',
+	'rankToETL'
+
+])
+
+# Setting the Spark Session and Initialize the GlueContext
+sc = SparkContext()
+glueContext = GlueContext(sc)
+# Increase the spark broadcastTimeout in order to combat an issue where joining data frames times out
+# spark = SparkSession.builder.config("spark.sql.broadcastTimeout", "3600").getOrCreate()
+spark = glueContext.spark_session
+job = Job(glueContext)
+
+# Initialize the job
+job.init(args['JOB_NAME'], args)
+
+# Print Starting Point to Search on In Logs
+print ('\n\n\n********************BFAS Output:********************\n\n\n')
+print('Start Time: ' + str(datetime.datetime.now()))
+
+
+
+# Create a list of regional centers from the regionalCenter parameter (default to all known as of 2/26/2019)
+#regionalCenters parameter must be comma delimited with NO SPACES!!!
+regional_centers = args['regionalCenters'].split(",")
+print('Your regional centers are: ' + str(regional_centers))
+
+
+# Create the rank to ETL and it's previous entry
+start_rank = int(args['rankToETL'])
+end_rank = start_rank + 1
+print('Your start rank is: ' + str(start_rank) + '\nYour end rank is: ' + str(end_rank))
+
+
+# Define the data restrictor predicate -- Upper date end of the predicate is not included.  If you want to be inclusive to today you must add a day ahead of your desired date.
+now = str(datetime.date.today() + datetime.timedelta(days=1))
+now_minus_7 = str(datetime.date.today() - datetime.timedelta(days=30))
+
+last_7_predicate = "data_extracted_timestamp between '" + now_minus_7 + "' AND '" + now + "'"
+#last_7_predicate_alias = "data_extracted_timestamp between '" + now_minus_7 + "' AND '" + now + "'"
+print("Your predicate will be: " + last_7_predicate)
+
+
+### Check the predicate for data within last 7 days for all regional centers ###
+
+### CHANGE THIS TO INTAKE and OUTCOMES LISAP
+
+
+
+# Read data from intake table - Changed to Report Data LISAP 6/17/19
+swamp_intake_events_report_dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+	database = args['swampDatabaseName'],
+	table_name = args['swampIntakesReportTableName'],
+	transformation_ctx = 'swamp_intake_events_report_dynamic_frame',
+	push_down_predicate = last_7_predicate)
+
+# Converts the DynamicFrame to a Spark Compatible DataFrame
+swamp_intake_events_report_data_frame = swamp_intake_events_report_dynamic_frame.toDF()
+
+
+# Read data from outcome table - Changed to Report Data LISAP 6/17/19
+swamp_outcome_events_report_dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+	database = args['swampDatabaseName'],
+	table_name = args['swampOutcomesReportTableName'],
+	transformation_ctx = 'swamp_outcome_events_report_dynamic_frame',
+	push_down_predicate = last_7_predicate)
+
+# Converts the DynamicFrame to a Spark Compatible DataFrame
+swamp_outcome_events_report_data_frame = swamp_outcome_events_report_dynamic_frame.toDF()
+
+
+
+#Run a check on the predicate to see if there is current intake data to deal with for the regional center
+#Is the intake data empty?
+if swamp_intake_events_report_data_frame is None or swamp_intake_events_report_data_frame.count() == 0:
+	#Is the outcome data empty?
+	if swamp_outcome_events_report_data_frame is None or swamp_outcome_events_report_data_frame.count() == 0:
+		print('There is no intake or outcome data for ' + str(regional_centers) + ' within the predicate. End ETL')
+		sys.exit()
+	#There is outcome data yes
+	else:
+		print('There is no intake data for ' + str(regional_centers) + ' within the predicate.')
+		pass
+#There is intake data yes
+else:
+	#But there is no outcome data
+	if swamp_outcome_events_report_data_frame is None or swamp_outcome_events_report_data_frame.count() == 0:
+		print('There is no outcome data for ' + str(regional_centers) + ' within the predicate.')
+		pass
+	#There is outcome data
+	else:
+		pass
+
+
+
+### Start the for loop ETL per Regional Center ###
+
+for regional_center in regional_centers:
+
+	#Print Regional Center
+	print('Trying Regional Center: ' + regional_center)
+
+	#Reset all parameters for subsequent runs where no data would be encountered
+	data_check_intake = None
+	data_check_outcome = None
+	formatted_swamp_intake_events_report_data_frame = None
+	formatted_swamp_outcome_events_report_data_frame = None
+	combined_current_swamp_data_frame = None
+	combined_final_data_frame = None
+	audit_data_frame = None
+	audit_data_frame_prep = None
+
+
+
+
+	# Pull the prefix for the regional center
+	# Read data from swamp table
+	dynamodb_config_dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+		database = args['swampDatabaseName'],
+		table_name = args['swampDynamoDBTableName'].lower().replace('-', '_'),
+		transformation_ctx = 'dynamodb_config_dynamic_frame')
+
+	# Converts the DynamicFrame to a Spark Compatible DataFrame
+	dynamodb_config_data_frame = dynamodb_config_dynamic_frame.toDF()
+
+	#Create a temp view from the data frame
+	dynamodb_config_data_frame.createOrReplaceTempView("bfas_dynamodb_config")
+
+	#Select the data from the frame
+	config_sql ="""select regionalCenterPrefix from bfas_dynamodb_config where regionalCenterName = '""" + regional_center + """'"""
+	config_data_frame = spark.sql(config_sql)
+	bfas_prefix = config_data_frame.first()['regionalCenterPrefix']
+	print('BFAS Prefix is: ' + str(bfas_prefix))
+
+
+
+	### DynamoDB ETL Audit Table ###
+	# Read data from etl audit swamp table
+	dynamodb_audit_dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+		database = args['swampDatabaseName'],
+		table_name = args['swampDynamoDBTable2Name'].lower().replace('-', '_'),
+		transformation_ctx = 'dynamodb_audit_dynamic_frame')
+
+	# Converts the DynamicFrame to a Spark Compatible DataFrame
+	dynamodb_audit_data_frame = dynamodb_audit_dynamic_frame.toDF()
+
+	#Create a temp view from the data frame
+	dynamodb_audit_data_frame.createOrReplaceTempView("bfas_dynamodb_audit")
+
+
+
+
+	#### Creating the temporary view, for use later in join, for the Main/Full API Content ####
+	#print('Main API Start Time: ' + str(datetime.datetime.now()))
+
+	#Run a check on the predicate to see if there is current intake or outcome data to deal with for the regional center
+	if (swamp_intake_events_report_data_frame is None or swamp_intake_events_report_data_frame.count() == 0) and (swamp_outcome_events_report_data_frame is None or swamp_outcome_events_report_data_frame.count() == 0):
+		print('There is no intake or outcome data for ' + regional_center + ' within the predicate.  Skipping this regional center!')
+		continue
+	else:
+		swamp_intake_events_report_data_frame.createOrReplaceTempView("bfas_predicate_temporary_view")
+		data_intake_check_sql ="""select count(*) as count from bfas_predicate_temporary_view where (center_name = '""" + regional_center + """' and regexp_replace(data_extracted_timestamp,":",".") 	NOT IN (select dataextractedtimestamp from bfas_dynamodb_audit where ecosystemname = 'shelterluv_animals_events_""" + regional_center +  """'))"""
+		print('Data Check Intake SQL: ' + str(data_intake_check_sql))
+		predicate_intake_data_frame = spark.sql(data_intake_check_sql)
+		data_check_intake = predicate_intake_data_frame.first()['count']
+		print('Data Check Intake =: ' + str(data_check_intake))
+
+	# Check to see if there are any timestamps within the predicate for the intake data.
+	if data_check_intake > 0:
+
+
+
+		#### Creating the temporary view, to use later in join, for the Edited Report Content ####
+		print('Intake Report Start Time: ' + str(datetime.datetime.now()))
+
+		try:
+
+			# Read data from swamp table
+			swamp_intake_events_report_dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+				database = args['swampDatabaseName'],
+				table_name = args['swampIntakesReportTableName'],
+				transformation_ctx = 'swamp_intake_events_report_dynamic_frame',
+				push_down_predicate = last_7_predicate)
+
+			# Converts the DynamicFrame to a Spark Compatible DataFrame
+			swamp_intake_events_report_data_frame = swamp_intake_events_report_dynamic_frame.toDF()
+
+			# Select the fields from the Swamp edited report table into a temporary view
+			swamp_intake_events_report_data_frame.createOrReplaceTempView("bfas_intake_report_temporaryview")
+
+			SQL_intake_report ="""
+				SELECT
+					to_date(`intake date`, 'MM/dd/yyyy') as animal_event_date,
+					cast('intake' as varchar(255)) as animal_event,
+					cast(`intake type` as varchar(255)) as animal_event_type,
+					cast(`intake sub-type` as varchar(255)) as animal_event_sub_type,
+					cast(`intake time` as varchar(255)) as animal_event_time,
+					cast(regexp_replace(`animal id`,"(-[0-9])$","") as varchar(255)) as animal_id,
+					cast(`name` as varchar(255)) as animal_name,
+					cast(`previous shelter id` as varchar(255)) as previous_shelter_id,
+					cast(`previous id issuing shelter` as varchar(255)) as previous_issuing_shelter_id,
+					cast(`species` as varchar(255)) as species,
+					cast(`primary breed` as varchar(255)) as primary_breed,
+					cast(`secondary breed` as varchar(255)) as secondary_breed,
+					cast(`age (months)` as int) as age_months,
+					cast(`age group` as varchar(255)) as age_group,
+					to_date(`date of birth`, 'MM/dd/yyyy') as date_of_birth,
+					cast(`size group` as varchar(255)) as size_group,
+					cast(`sex` as varchar(255)) as sex,
+					cast(`primary color` as varchar(255)) as primary_color,
+					cast(`secondary color` as varchar(255)) as secondary_color,
+					cast(`pattern` as varchar(255)) as pattern,
+					cast('' as varchar(255)) as altered,
+					cast(`altered in care` as varchar(255)) as altered_in_care,
+					cast(`altered before arrival` as varchar(255)) as altered_before_arrival,
+					cast(`transfer from` as varchar(255)) as transfer_from,
+					cast('' as varchar(255)) as transfer_to,
+					cast(`original source` as varchar(255)) as original_source,
+					cast(`intake by` as varchar(255)) as animal_event_user,
+					cast('' as varchar(255)) as adoption_counselor,
+					cast(`intake from(id)` as varchar(255)) as animal_event_person_id,
+					cast(`intake from name` as varchar(255)) as animal_event_person_name,
+					cast(`intake from (street address)` as varchar(255)) as animal_event_person_street_address,
+					cast(`intake from (city)` as varchar(255)) as animal_event_person_city,
+					cast(`intake from (state)` as varchar(255)) as animal_event_person_state,
+					cast(`intake from (zip code)` as varchar(255)) as animal_event_person_zip_code,
+					cast(`intake from (email address)` as varchar(255)) as animal_event_person_email_address,
+					cast(`intake from (phone number)` as varchar(255)) as animal_event_person_phone_number,
+					cast(`address found (full address)` as varchar(255)) as address_found_street_address,
+					cast(`address found (zip code)` as varchar(255)) as address_found_zip_code,
+					cast(`address found (cross street)` as varchar(255))  as address_found_cross_street,
+					cast(`address found (county)` as varchar(255)) as address_found_county,
+					cast(`how did you hear about us` as varchar(255)) as how_did_you_hear_about_us,
+					cast(`intake county` as varchar(255)) as intake_county,
+					cast(`attributes` as varchar(255)) as attributes,
+					cast(`microchip number` as varchar(255)) as microchip_number,
+					cast(`adoption category` as varchar(255)) as adoption_category,
+					cast(`behavior category` as varchar(255)) as behavior_category,
+					cast(`medical category` as varchar(255)) as medical_category,
+					cast(`volunteer category` as varchar(255)) as volunteer_category,
+					cast(`location` as varchar(255)) as location,
+					cast(`first location` as varchar(255)) as first_location,
+					cast('' as varchar(255)) as last_location,
+					cast(`condition at intake` as varchar(255)) as condition_at_intake,
+					cast('' as varchar(255)) as cause_of_death,
+					cast('' as varchar(255)) as animal_internal_id,
+					cast('' as varchar(255)) as person_internal_id,
+					now() as date_added_to_lake,
+					-- Partitions
+					-- Must remain string data type
+					center_name as center_name,
+					data_extracted_year as data_extracted_year,
+					data_extracted_month as data_extracted_month,
+					data_extracted_day as data_extracted_day,
+					data_extracted_hour as data_extracted_hour,
+					regexp_replace(data_extracted_timestamp,":",".") as data_extracted_timestamp
+				FROM
+					bfas_intake_report_temporaryview
+				WHERE
+					data_extracted_timestamp IN(
+						SELECT data_extracted_timestamp
+						FROM (
+							   SELECT data_extracted_timestamp,
+								rank() OVER(ORDER BY data_extracted_timestamp DESC) AS rank
+							   FROM (SELECT DISTINCT data_extracted_timestamp FROM bfas_outcome_report_temporaryview
+							         WHERE center_name = '""" + regional_center + """'
+							         and regexp_replace(data_extracted_timestamp,":",".") NOT IN (select dataextractedtimestamp from bfas_dynamodb_audit where ecosystemname = 'shelterluv_animals_events_""" + regional_center +  """')
+							         )
+									)
+						 WHERE rank = """ + str(start_rank) + """)
+					and center_name = '""" + regional_center + """'"""
+
+
+
+#				WHERE
+#					data_extracted_timestamp IN(
+#						SELECT DISTINCT data_extracted_timestamp FROM bfas_intake_report_temporaryview
+#							         WHERE center_name = '""" + regional_center + """'
+#
+#				         )
+#						 AND center_name = '""" + regional_center + """'"""
+
+#AND regexp_replace(data_extracted_timestamp,":",".") NOT IN (select dataextractedtimestamp from bfas_dynamodb_audit where ecosystemname = 'shelterluv_animals_events_""" + regional_center +  """')
+#				WHERE
+#					data_extracted_timestamp IN(
+#						SELECT data_extracted_timestamp
+#						FROM (
+#							   SELECT data_extracted_timestamp,
+#								rank() OVER(ORDER BY data_extracted_timestamp DESC) AS rank
+#							   FROM (SELECT DISTINCT data_extracted_timestamp FROM bfas_intake_report_temporaryview
+#							         WHERE center_name = '""" + regional_center + """'
+#							         and regexp_replace(data_extracted_timestamp,":",".") NOT IN (select dataextractedtimestamp from bfas_dynamodb_audit where ecosystemname = 'shelterluv_animals_events_""" + regional_center +  """')
+#							         )
+#									)
+#						 WHERE rank = """ + str(start_rank) + """)
+#					and center_name = '""" + regional_center + """'"""
+
+			# Use the spark object to apply the changes
+			formatted_swamp_intake_events_report_data_frame = spark.sql(SQL_intake_report)
+			print('The count of rows in the formatted intake report data frame is: {} '.format(formatted_swamp_intake_events_report_data_frame.count()))
+
+			# Use the updated fields to create a new view
+			formatted_swamp_intake_events_report_data_frame.createOrReplaceTempView("bfas_intake_report_temporaryview_formatted")
+
+		except Exception as e:
+			print(e)
+			print('Something has gone wrong with the formatted intake report data frame.  The count of rows written is Zero')
+			pass
+
+
+
+
+	if (swamp_outcome_events_report_data_frame is None or swamp_outcome_events_report_data_frame.count() == 0):
+		print('There is no outcome data for ' + regional_center + ' within the predicate.  Skipping this regional center!')
+
+	else:
+		swamp_outcome_events_report_data_frame.createOrReplaceTempView("bfas_predicate_outcome_temporary_view")
+		data_outcome_check_sql ="""select count(*) as count from bfas_predicate_outcome_temporary_view where (center_name = '""" + regional_center + """' and regexp_replace(data_extracted_timestamp,":",".") 	NOT IN (select dataextractedtimestamp from bfas_dynamodb_audit where ecosystemname = 'shelterluv_animals_events_""" + regional_center +  """'))"""
+		print('Data Check Outcome SQL: ' + str(data_outcome_check_sql))
+		predicate_outcome_data_frame = spark.sql(data_outcome_check_sql)
+		data_check_outcome = predicate_outcome_data_frame.first()['count']
+		print('Data Check Outcome =: ' + str(data_check_outcome))
+
+	# Check to see if there are any timestamps within the predicate for the outcome data.
+	if data_check_outcome > 0:
+
+
+
+
+		#### Creating the temporary view, to use later in join, for the Outcome Report Content ####
+		print('Outcome Report Start Time: ' + str(datetime.datetime.now()))
+
+		try:
+
+			# Read data from swamp table
+			swamp_outcome_report_dynamic_frame = glueContext.create_dynamic_frame.from_catalog(
+				database = args['swampDatabaseName'],
+				table_name = args['swampOutcomesReportTableName'],
+				transformation_ctx = 'swamp_outcome_report_dynamic_frame',
+				push_down_predicate = last_7_predicate)
+
+			# Converts the DynamicFrame to a Spark Compatible DataFrame
+			swamp_outcome_events_report_data_frame = swamp_outcome_events_report_dynamic_frame.toDF()
+
+			# Select the fields from the Swamp created report table into a temporary view
+			swamp_outcome_events_report_data_frame.createOrReplaceTempView("bfas_outcome_report_temporaryview")
+
+			SQL_outcome_report = """
+				SELECT
+					to_date(`outcome date`, 'MM/dd/yyyy') as animal_event_date,
+					cast('outcome' as varchar(255)) as animal_event,
+					cast(`outcome type` as varchar(255)) as animal_event_type,
+					cast(`outcome sub-type` as varchar(255)) as animal_event_sub_type,
+					cast(`outcome time` as varchar(255)) as animal_event_time,
+					cast(regexp_replace(`animal id`,"(-[0-9])$","") as varchar(255)) as animal_id,
+					cast(`name` as varchar(255)) as animal_name,
+					cast('' as varchar(255)) as previous_shelter_id,
+					cast('' as varchar(255)) as previous_issuing_shelter_id,
+					cast(`species` as varchar(255)) as species,
+					cast(`primary breed` as varchar(255)) as primary_breed,
+					cast(`secondary breed` as varchar(255)) as secondary_breed,
+					cast(`age (months)` as int) as age_months,
+					cast(`age group` as varchar(255)) as age_group,
+					to_date('', 'MM/dd/yyyy') as date_of_birth,
+					cast(`size group` as varchar(255)) as size_group,
+					cast(`sex` as varchar(255)) as sex,
+					cast(`primary color` as varchar(255)) as primary_color,
+					cast(`secondary color` as varchar(255)) as secondary_color,
+					cast(`pattern` as varchar(255)) as pattern,
+					cast(`altered` as varchar(255)) as altered,
+					cast('' as varchar(255)) as altered_in_care,
+					cast(`altered before arrival` as varchar(255)) as altered_before_arrival,
+					cast('' as varchar(255)) as transfer_from,
+					cast(`transfer to` as varchar(255)) as transfer_to,
+					cast(`original source` as varchar(255)) as original_source,
+					cast(`outcome by` as varchar(255)) as animal_event_user,
+					cast(`adoption counselor` as varchar(255)) as adoption_counselor,
+					cast(`assoc. person id` as varchar(255)) as animal_event_person_id,
+					cast(`assoc. person name` as varchar(255)) as animal_event_person_name,
+					cast(`assoc. person street address` as varchar(255)) as animal_event_person_street_address,
+					cast(`assoc. person city` as varchar(255)) as animal_event_person_city,
+					cast(`assoc. person state` as varchar(255)) as animal_event_person_state,
+					cast(`assoc. person zip code` as varchar(255)) as animal_event_person_zip_code,
+					cast(`assoc. person email address` as varchar(255)) as animal_event_person_email_address,
+					cast(`assoc. person phone number` as varchar(255)) as animal_event_person_phone_number,
+					cast('' as varchar(255)) as address_found_street_address,
+					cast('' as varchar(255)) as address_found_zip_code,
+					cast('' as varchar(255)) as address_found_cross_street,
+					cast('' as varchar(255)) as address_found_county,
+					cast(`how did you hear about us` as varchar(255)) as how_did_you_hear_about_us,
+					cast('' as varchar(255)) as intake_county,
+					cast(`attributes` as varchar(255)) as attributes,
+					cast(`microchip number` as varchar(255)) as microchip_number,
+					cast(`adoption category` as varchar(255)) as adoption_category,
+					cast(`behavior category` as varchar(255)) as behavior_category,
+					cast(`medical category` as varchar(255)) as medical_category,
+					cast(`volunteer category` as varchar(255)) as volunteer_category,
+					cast(`location` as varchar(255)) as location,
+					cast('' as varchar(255)) as first_location,
+					cast(`last location` as varchar(255)) as last_location,
+					cast('' as varchar(255)) as condition_at_intake,
+					cast(`cause of death` as varchar(255)) as cause_of_death,
+					cast('' as varchar(255)) as animal_internal_id,
+					cast('' as varchar(255)) as person_internal_id,
+					now() as date_added_to_lake,
+					-- Partitions
+					-- Must remain string data type
+					center_name as center_name,
+					data_extracted_year as data_extracted_year,
+					data_extracted_month as data_extracted_month,
+					data_extracted_day as data_extracted_day,
+					data_extracted_hour as data_extracted_hour,
+					regexp_replace(data_extracted_timestamp,":",".") as data_extracted_timestamp
+				FROM
+					bfas_outcome_report_temporaryview
+
+
+				WHERE
+					data_extracted_timestamp IN(
+						SELECT data_extracted_timestamp
+						FROM (
+							   SELECT data_extracted_timestamp,
+								rank() OVER(ORDER BY data_extracted_timestamp DESC) AS rank
+							   FROM (SELECT DISTINCT data_extracted_timestamp FROM bfas_outcome_report_temporaryview
+							         WHERE center_name = '""" + regional_center + """'
+							         and regexp_replace(data_extracted_timestamp,":",".") NOT IN (select dataextractedtimestamp from bfas_dynamodb_audit where ecosystemname = 'shelterluv_animals_events_""" + regional_center +  """')
+							         )
+									)
+						 WHERE rank = """ + str(start_rank) + """)
+					and center_name = '""" + regional_center + """'"""
+
+#				WHERE
+#					data_extracted_timestamp IN(
+#						SELECT DISTINCT data_extracted_timestamp FROM bfas_outcome_report_temporaryview
+#							         WHERE center_name = '""" + regional_center + """'
+#
+#				         )
+#						 AND center_name = '""" + regional_center + """'"""
+
+
+
+
+			# Use the spark object to apply the changes
+			formatted_swamp_outcome_events_report_data_frame = spark.sql(SQL_outcome_report)
+			print('The count of rows in the formatted outcomes report data frame is: {} '.format(formatted_swamp_outcome_events_report_data_frame.count()))
+
+			# Use the updated fields to create a new view
+			formatted_swamp_outcome_events_report_data_frame.createOrReplaceTempView("bfas_outcome_report_temporaryview_formatted")
+
+		except Exception as e:
+			print(e)
+			print('Something has gone wrong with the formatted outcomes report data frame.  The count of rows written is Zero')
+			pass
+
+	if data_check_outcome > 0 or data_check_intake > 0:
+
+		### Join the two CURRENT TIMESTAMP temporary views: intake and outcomes. ###
+		print('Join Current Dataframes Start Time: ' + str(datetime.datetime.now()))
+
+		# Join the current two temporary views
+#		if (formatted_swamp_intake_events_report_data_frame.count() > 0 or formatted_swamp_outcome_events_report_data_frame.count() > 0):
+
+		# Current intake and outcome report data frames have data
+		try:
+			if (data_check_outcome > 0 and data_check_intake > 0):
+				SQL_current_combined = """
+							select
+								t1.*
+							from
+								(select * from bfas_intake_report_temporaryview_formatted e
+							union
+								select * from bfas_outcome_report_temporaryview_formatted c)
+							as t1"""
+
+			else:
+				if (data_check_intake > 0):
+							SQL_current_combined = """
+								select t1.* from bfas_intake_report_temporaryview_formatted
+								as t1"""
+				else:
+							SQL_current_combined = """
+								select t1.* from bfas_outcome_report_temporaryview_formatted
+								as t1"""
+
+			print(SQL_current_combined)
+			# Use the spark object to apply the changes
+			combined_current_swamp_data_frame = spark.sql(SQL_current_combined)
+			print('SQL_current_combined statement ran')
+			#Leave this line to put it into SQL for the name parser.  creates a table for SQL statements
+			combined_current_swamp_data_frame.createOrReplaceTempView('bfas_events_temporaryview_combined_swamp')
+
+			#Output the count from the join
+			print('The count of rows in the current-data data frame is: {} '.format(combined_current_swamp_data_frame.count()))
+
+
+		except Exception as e:
+			print(e)
+			print('Something has gone wrong in joining the two current timestamp views.')
+			continue
+
+
+
+#Change data sink and audit trail to read parsed_swamp_data_frame  ***************************************
+
+
+		### Write it all out to a data frame ###
+		print('DataSink Start Time: ' + str(datetime.datetime.now()))
+
+		# Check to see if there are any timestamps within the predicate for the api data.
+		if (data_check_intake == 0 or data_check_intake is None) and (data_check_outcome == 0 or data_check_outcome is None):
+			print('There is no API data for ' + regional_center + ' within the predicate.  Cannot write anything to the data sink for the ' + regional_center + ' regional center.')
+			continue
+		else:
+			try:
+				if combined_current_swamp_data_frame.count() > 0:
+
+					#Convert the data frame back to a dynamic frame
+					final_dynamic_frame = DynamicFrame.fromDF(combined_current_swamp_data_frame,glueContext,"final_dynamic_frame")
+					print('Mapping of Final Dynamic Frame is complete.  Final row count is:  {} '.format(final_dynamic_frame.count()))
+
+					# Write the joined dynamic frame out to a datasink
+					datasink = glueContext.write_dynamic_frame.from_options(
+					        frame = final_dynamic_frame, connection_type = "s3",
+					        connection_options = {
+					            'path': 's3://{lakeBucketName}/{lakePath}/'.format(
+									lakeBucketName=args['lakeBucketName'],
+									lakePath=args['lakeDestinationPath']),
+								"partitionKeys": ['center_name','data_extracted_year','data_extracted_month','data_extracted_day','data_extracted_hour','data_extracted_timestamp']},
+					        format = "parquet",
+					        transformation_ctx = "datasink")
+
+					# Print regional center is complete
+					print('Regional Center ETL is complete: ' + regional_center)
+
+				else:
+					print('Unable to write the data sink for regional center: ' + regional_center + '.  There is likely no data')
+
+			except Exception as e:
+				print(e)
+				print('The location ' + regional_center + ' produced no data.')
+				continue
+
+
+		### Write a Log trail to the DynamoDB table ###
+		print('Audit DataSink Start Time: ' + str(datetime.datetime.now()))
+
+
+
+
+		# Check to see if there are any timestamps within the predicate for the api data.
+		if (data_check_intake == 0 or data_check_intake is None) and (data_check_outcome == 0 or data_check_outcome is None):
+			print('There is no API data for ' + regional_center + ' within the predicate.  Cannot write anything to the data sink for the ' + regional_center + ' regional center.')
+
+		else:
+			try:
+				# Create the data frame to select the timestamp from.  This creates a view from the data frame.
+				combined_current_swamp_data_frame.createOrReplaceTempView('bfas_combined_final_data_frame')
+
+				# SQL used to gather the data
+				timestamp_sql = """
+								select
+									distinct data_extracted_timestamp as dataExtractedTimestamp,
+									concat('shelterluv_animals_events_',center_name) as ecosystemName
+								from
+									bfas_combined_final_data_frame
+								where
+									center_name = '""" + regional_center + """'
+					"""
+				# Make a data frame from SQL
+				audit_data_frame=spark.sql(timestamp_sql)
+				audit_data_frame.show(45,False)
+				# Create the boto3 resource
+				dynamodb = boto3.resource('dynamodb','us-west-2')
+				print('dynamodb initialized')
+				# Define the table name using the argument
+				table = dynamodb.Table(args['swampDynamoDBTable2Name'])
+				print('dynamodb dynamodb args')
+
+				# Convert the row in the data frame to JSON
+#				print(audit_data_frame.toJSON())
+#				audit_data_frame_prep = json.loads(audit_data_frame.toJSON())
+
+				audit_data_frame_json = audit_data_frame.toJSON()
+
+#				for row in audit_data_frame_json.collect():
+#					#json string
+#					print(row)
+#					table.put_item( Item = json.loads(row) )
+
+				    #json object
+#				    line = json.loads(row)#
+#				    print(line["dataExtractedTimestamp"])
+
+#				for dataExtractedTimestamp, ecosystemName in audit_data_frame_prep.items():
+#					print dataExtractedTimestamp
+#					print ecosystemName
+#					audit_data_frame_prep = json.loads(audit_data_frame.toJSON().first())
+
+
+#				print(audit_data_frame_prep)
+
+				# Show what will write to the Dynamo Table
+				print('Writing to Dynamodb Table')
+#				audit_data_frame_json.show()
+
+
+				# Write the item to DynamoDB
+				try:
+#					outcome = dynamoDB.batchWriteItemUnprocessed(audit_data_frame_json);
+					for row in audit_data_frame_json.collect():
+						#json string
+						print(row)
+						table.put_item( Item = json.loads(row) )
+
+					print('Audit trail successfully written for ' + regional_center + '.')
+
+				except Exception as e:
+					print(e)
+					print('Could not write data to the Audit Table for regional center: ' + regional_center + '.')
+					pass
+
+			except Exception as e:
+				print(e)
+				print('Could not write to the Audit Table for regional center: ' + regional_center + '.')
+				pass
+
+
+#Print Completion Statement
+print('ETL Job is complete for all regional centers')
+print('End Time: ' + str(datetime.datetime.now()))
+
+# Commit the job!
+job.commit()
