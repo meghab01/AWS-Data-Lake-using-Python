@@ -1,0 +1,44 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "ETL for Monitis data"
+Parameters:
+  BFASAccountName:
+    Description: Parameter for the AWS Account Name
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /org/member/local/account_alias
+  IAMRoleGlueServiceArn:
+    Description: Parameter for the Glue IAM Role ARN
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /org/member/local/iam/role/glue/service/arn
+  s3BucketName:
+    Type: String
+    Default: "s3-swamp"
+    Description: "Swamp S3 Bucket Name"
+Resources:
+  ETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Role: !Ref IAMRoleGlueServiceArn
+#SUBSTITUTION
+      Name: !Sub "${BFASAccountName}-Monitis-ETL"
+      Command:
+        Name: glueetl
+#SUBSTITUTION
+        ScriptLocation: !Sub "s3://${BFASAccountName}-s3-glue-scripts/Monitis_ETL.py"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 0
+      AllocatedCapacity: 2
+    Type: AWS::Glue::Crawler
+    Properties: 
+      DatabaseName: !Sub "${BFASAccountName}-glue-database-swamp"
+      Description: "glue crawler to crawl incoming logs data"
+      Name: !Sub "${BFASAccountName}-Monitis-ETL"
+      Role: !Ref IAMRoleGlueServiceArn
+      Tags: "Enterprise Data"
+        Targets: 
+          S3Targets:
+            - Path: !Sub "s3://${BFASAccountName}-s3-swamp/Logs/Internal/Monitis/MonitisAPI/Serde"
+
+Outputs:
+  ETLJobOutput:
+    Value: !Ref ETLJob

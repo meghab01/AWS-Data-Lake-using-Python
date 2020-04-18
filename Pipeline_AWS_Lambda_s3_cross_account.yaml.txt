@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Pulls ads from digital ocean buckets to BFAS data swamp
+Parameters:
+  accountAlias:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /org/member/local/account_alias
+    Description: SSM - Local Account - Alias
+  accountType:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /org/member/local/account_type
+    Description: SSM - Local Account - Account Type
+  functionRoleArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /org/member/local/iam/role/lambda/getclmonthlyextracts/arn
+    Description: Function Role Arn
+Resources:
+  getclmonthlyextracts:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${accountAlias}-getcraigslistmonthlyextracts"
+      Handler: getclmonthlyextracts.handler
+      Runtime: python3.6
+      Role: 
+        Ref: functionRoleArn
+      Description: Pulls ads from digital ocean buckets to BFAS data swamp
+      MemorySize: 128
+      Timeout: 60
+      Environment:
+        Variables:
+          s3bucket: 
+            Ref: accountAlias
+      Tags:
+        Application: Datalake
+        Department: DATA
+        Environment:
+          Ref: accountType
+        accountAlias:
+          Ref: accountAlias
+
+          

@@ -1,0 +1,45 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Pulls ads from digital ocean buckets to BFAS data swamp
+Parameters:
+  accountAlias:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /org/member/local/account_alias
+    Description: SSM - Local Account - Alias
+  accountType:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /org/member/local/account_type
+    Description: SSM - Local Account - Account Type
+  functionRoleArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /org/member/local/iam/role/lambda/digitaloceancldata/arn
+    Description: Function Role Arn
+  application:
+    Type: String
+    Default: Datalake
+    Description: Name of the application this function belongs to.
+  department:
+    Type: String
+    Default: DATA
+    Description: Department to be billed.    
+Resources:
+  getpetsalesimages:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${accountAlias}-pulldigitaloceancldata"
+      Handler: getpetsalesimages.handler
+      Runtime: python3.6
+      Description: Pulls ads from digital ocean buckets to BFAS data swamp
+      MemorySize: 128
+      Timeout: 60
+      Role:
+        Ref: functionRoleArn
+      Tags:
+        Application: 
+          Ref: application
+        Department: 
+          Ref: department
+        Environment: 
+          Ref: accountType
+        accountAlias: 
+          Ref: accountAlias
